@@ -63,6 +63,7 @@ export async function createPinnedRelayTransport(opts: RelayTransportOptions): P
   }
   relayUrl.pathname = '/';
   relayUrl.search = '';
+  const relayIsIp = isIP(relayUrl.hostname.replace(/^\[|\]$/g, '')) !== 0;
   const issuerUrl = new URL(opts.issuerUrl);
   if (issuerUrl.protocol !== 'https:' || issuerUrl.username || issuerUrl.password || issuerUrl.hash || issuerUrl.port) {
     throw new TypeError('issuerUrl must be an HTTPS URL on port 443 without credentials or a fragment');
@@ -120,10 +121,10 @@ export async function createPinnedRelayTransport(opts: RelayTransportOptions): P
         // Undici fills an omitted SNI name from the proxy URI, which fails for
         // IP literals in Node. Use a non-routable DNS name; the attested SPKI
         // check, not the SNI hostname, authenticates the relay certificate.
-        servername: isIP(relayUrl.hostname.replace(/^\[|\]$/g, '')) ? 'wraps-relay.invalid' : relayUrl.hostname,
+        servername: relayIsIp ? 'wraps-relay.invalid' : relayUrl.hostname,
         // The relay endpoint may be an IP while its attested cert has no IP
         // SAN. The receipt's SPKI pin authenticates that cert directly.
-        checkServerIdentity: (hostname, peer) => checkPinnedIdentity(hostname, peer, attested.tunnelKey, false),
+        checkServerIdentity: (hostname, peer) => checkPinnedIdentity(hostname, peer, attested.tunnelKey, !relayIsIp),
       },
       ...(requestTls ? { requestTls } : {}),
     });
