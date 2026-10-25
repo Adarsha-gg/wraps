@@ -15,21 +15,25 @@ The relay attestation endpoint returns JSON in this shape:
 }
 ```
 
-The attestation's `user_data` must bind `hashPublicKeys({ tunnel })` and the request nonce. By default, the receipt is fetched from `http://<relay-host>/attestation`; that response is treated as untrusted until the verifier accepts the nonce-bound receipt. Only HTTPS destination requests are accepted by the returned transport.
+The attestation's `user_data` must bind `hashPublicKeys({ tunnel })` and the request nonce. By default, the receipt is fetched from `http://<relay-host>:8080/attestation`; that response is treated as untrusted until the verifier accepts the nonce-bound receipt. Bootstrap has a 10-second deadline and a 64 KiB response limit. Only HTTPS destination requests are accepted by the returned transport.
 
 ```ts
-const transport = await createPinnedRelayTransport({
+const relayTransport = await createPinnedRelayTransport({
   relayUrl: 'https://relay.example:8443',
   verifier,
 });
 
-const sdk = new PrivatePayClient({ issuerUrl, verifier, wallet, caps, transport });
+const sdk = new PrivatePayClient({ issuerUrl, verifier, wallet, caps, relayTransport });
 try {
   await sdk.connect();
-  // use sdk.fetch(), sdk.quote(), and sdk.topUp() through the relay
+  await sdk.topUp(10); // issuer attestation and top-ups use direct HTTPS
+  await sdk.fetch('https://merchant.example/data');
+  // sdk.quote() and merchant fetches use the relay; issuer calls do not.
 } finally {
-  await transport.close();
+  await relayTransport.close();
 }
 ```
 
-The relay service must expose the TLS endpoint and attestation response described above. The current CONNECT server and enclave wiring are tracked separately in RLY-01 through RLY-03.
+Relay mode requires a pre-top-up before the first merchant request because the relay needs a blind-token batch in `Proxy-Authorization` before it opens CONNECT and the merchant can issue its 402 challenge. The default is one dedicated relay token per tunnel, covering up to 10 MB. A paid fetch uses one relay batch for the initial challenge request, one for the retry, and the merchant's quoted price in separate origin `Authorization` credentials. `quote()` uses one relay batch. All reserved relay batches count against the daily cap and are removed before dispatch, even if the relay later reports an ambiguous failure. Set `relayTokensPerTunnel` between 1 and 100 to reserve a larger batch; the full batch is conservatively charged even when fewer metering blocks are settled.
+
+`transport` remains the direct transport for issuer attestation and top-ups. Without `relayTransport`, merchant traffic continues to use the existing direct transport behavior. The relay service must expose the pinned TLS endpoint and attestation response described above. The CONNECT listener expects its meter tokens only in `Proxy-Authorization`; the merchant's `Authorization` header remains end-to-end inside TLS.

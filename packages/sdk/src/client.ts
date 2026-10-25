@@ -15,6 +15,7 @@ import {
   tokensToRlusd,
 } from '@wraps/issuer';
 import { Token, TokenVerifier, blindTokens, encodeAuthorization, equalBytes, finalizeTokens } from '@wraps/tokens';
+import type { PinnedRelayTransport } from './relay';
 
 export interface Caps {
   /** Most tokens one call may cost. A 402 above this is refused. */
@@ -33,8 +34,8 @@ export class PaymentRefusedError extends Error {
 }
 
 export class InsufficientTokensError extends Error {
-  constructor(readonly needed: number, readonly have: number) {
-    super(`need ${needed} tokens, have ${have}`);
+  constructor(readonly needed: number, readonly have: number, purpose?: string) {
+    super(`need ${needed} tokens, have ${have}${purpose ? ` (${purpose})` : ''}`);
     this.name = 'InsufficientTokensError';
   }
 }
@@ -58,11 +59,12 @@ export interface PrivatePayOptions {
   verifier: AttestationVerifier;
   wallet: TopUpWallet;
   caps: Caps;
-  /**
-   * How HTTP leaves the agent. Defaults to fetch. SDK-02 plugs the relay tunnel in here,
-   * so every call (attestation, top-up, purchases) goes through it.
-   */
+  /** Direct transport for issuer attestation and top-ups. Defaults to fetch. */
   transport?: Transport;
+  /** Pinned relay used for merchant traffic; issuer attestation/top-ups stay direct. */
+  relayTransport?: PinnedRelayTransport;
+  /** Blind tokens reserved for each new relay CONNECT. Defaults to 1 (10 MB of metering). */
+  relayTokensPerTunnel?: number;
   now?: () => number;
   onEvent?: (e: SdkEvent) => void;
 }
@@ -75,11 +77,16 @@ export class PrivatePayClient {
   private tokens: Token[] = [];
   private spent = { day: '', tokens: 0 };
   private readonly transport: Transport;
+  private readonly relayTokensPerTunnel: number;
   private readonly now: () => number;
   private readonly emit: (e: SdkEvent) => void;
 
   constructor(private readonly opts: PrivatePayOptions) {
     this.transport = opts.transport ?? fetch;
+    this.relayTokensPerTunnel = opts.relayTokensPerTunnel ?? 1;
+    if (opts.relayTransport && (!Number.isInteger(this.relayTokensPerTunnel) || this.relayTokensPerTunnel < 1 || this.relayTokensPerTunnel > 100)) {
+      throw new TypeError('relayTokensPerTunnel must be an integer from 1 through 100');
+    }
     this.now = opts.now ?? Date.now;
     this.emit = opts.onEvent ?? (() => {});
   }
@@ -155,8 +162,11 @@ export class PrivatePayClient {
   /** Asks the price without paying. Returns null if the resource is free. */
   async quote(url: string): Promise<Quote | null> {
     this.attested();
-    const res = await this.transport(url);
-    if (res.status !== 402) return null;
+    const res = await this.requestMerchant(url);
+    if (res.status !== 402) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
     const body = (await res.json()) as BlindTokenRequiredBody;
     this.checkChallenge(res, body);
     return { url, service: body.service, price: body.price };
@@ -168,7 +178,7 @@ export class PrivatePayClient {
    */
   async fetch(url: string, init: RequestInit = {}): Promise<Response> {
     this.attested();
-    const first = await this.transport(url, init);
+    const first = await this.requestMerchant(url, init);
     if (first.status !== 402) return first;
     const body = (await first.json()) as BlindTokenRequiredBody;
     this.checkChallenge(first, body);
@@ -182,19 +192,32 @@ export class PrivatePayClient {
     if (price > this.opts.caps.perCallTokens) {
       return this.refuse('PER_CALL_CAP', `price ${price} is above the per-call cap of ${this.opts.caps.perCallTokens}`);
     }
-    if (this.spentToday + price > this.opts.caps.dailyTokens) {
-      return this.refuse('DAILY_CAP', `price ${price} would exceed the daily cap (${this.spentToday}/${this.opts.caps.dailyTokens} spent)`);
+    const retryRelayCost = this.opts.relayTransport ? this.relayTokensPerTunnel : 0;
+    if (this.spentToday + price + retryRelayCost > this.opts.caps.dailyTokens) {
+      return this.refuse('DAILY_CAP', `price ${price} plus relay metering ${retryRelayCost} would exceed the daily cap (${this.spentToday}/${this.opts.caps.dailyTokens} spent)`);
     }
-    if (this.tokens.length < price) throw new InsufficientTokensError(price, this.tokens.length);
+    const neededTokens = price + retryRelayCost;
+    if (this.tokens.length < neededTokens) {
+      throw new InsufficientTokensError(
+        neededTokens,
+        this.tokens.length,
+        retryRelayCost > 0 ? `need ${retryRelayCost} relay meter token(s) plus ${price} merchant token(s)` : undefined,
+      );
+    }
 
-    // Count the spend before sending, so concurrent calls cannot slip past the cap.
+    // Reserve before dispatch. Relay tokens and merchant tokens are separate:
+    // one pays tunnel metering, the other is delivered inside end-to-end TLS.
     this.spent.tokens += price;
+    const relayTokens = retryRelayCost > 0 ? this.tokens.splice(0, retryRelayCost) : undefined;
     const pay = this.tokens.splice(0, price);
+    if (retryRelayCost > 0) this.spent.tokens += retryRelayCost;
     const headers = new Headers(init.headers);
     headers.set('authorization', encodeAuthorization(pay));
     // M3: name the merchant's single-use quote, so the payment is bound to this resource and price.
     if (body.quoteId) headers.set(QUOTE_HEADER, body.quoteId);
-    const res = await this.transport(url, { ...init, headers });
+    const res = this.opts.relayTransport && relayTokens
+      ? await this.opts.relayTransport.fetchWithTokens(url, { ...init, headers }, relayTokens)
+      : await this.transport(url, { ...init, headers });
     this.emit({ type: 'paid', url, price, balance: this.balance, spentToday: this.spent.tokens });
     return res;
   }
@@ -216,6 +239,31 @@ export class PrivatePayClient {
   private refuse(code: PaymentRefusedError['code'], message: string): never {
     this.emit({ type: 'refused', reason: `${code}: ${message}` });
     throw new PaymentRefusedError(code, message);
+  }
+
+  /** Send merchant traffic via the pinned relay after reserving its meter batch. */
+  private async requestMerchant(url: string, init?: RequestInit): Promise<Response> {
+    const relay = this.opts.relayTransport;
+    if (!relay) return this.transport(url, init);
+
+    this.rollDay();
+    if (this.spent.tokens + this.relayTokensPerTunnel > this.opts.caps.dailyTokens) {
+      return this.refuse('DAILY_CAP', `relay metering ${this.relayTokensPerTunnel} would exceed the daily cap (${this.spent.tokens}/${this.opts.caps.dailyTokens} spent)`);
+    }
+    if (this.tokens.length < this.relayTokensPerTunnel) {
+      throw new InsufficientTokensError(
+        this.relayTokensPerTunnel,
+        this.tokens.length,
+        'relay meter tokens are required before a CONNECT; call topUp() first',
+      );
+    }
+
+    // The relay may settle a token before a connection failure is visible.
+    // Consume and count the full batch before dispatch; never refund/retry an
+    // ambiguous CONNECT result.
+    const relayTokens = this.tokens.splice(0, this.relayTokensPerTunnel);
+    this.spent.tokens += this.relayTokensPerTunnel;
+    return relay.fetchWithTokens(url, init, relayTokens);
   }
 
   private rollDay() {
