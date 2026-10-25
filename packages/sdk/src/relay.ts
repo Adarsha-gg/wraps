@@ -117,7 +117,13 @@ export async function createPinnedRelayTransport(opts: RelayTransportOptions): P
       ...(proxyTokens ? { token: encodeAuthorization(proxyTokens) } : {}),
       proxyTls: {
         ca: attested.tlsCertificate,
-        checkServerIdentity: (hostname, peer) => checkPinnedIdentity(hostname, peer, attested.tunnelKey),
+        // Undici fills an omitted SNI name from the proxy URI, which fails for
+        // IP literals in Node. Use a non-routable DNS name; the attested SPKI
+        // check, not the SNI hostname, authenticates the relay certificate.
+        servername: isIP(relayUrl.hostname.replace(/^\[|\]$/g, '')) ? 'wraps-relay.invalid' : relayUrl.hostname,
+        // The relay endpoint may be an IP while its attested cert has no IP
+        // SAN. The receipt's SPKI pin authenticates that cert directly.
+        checkServerIdentity: (hostname, peer) => checkPinnedIdentity(hostname, peer, attested.tunnelKey, false),
       },
       ...(requestTls ? { requestTls } : {}),
     });
@@ -492,9 +498,11 @@ function responseWithCleanup(response: Response, cleanup: () => Promise<void>): 
   return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 }
 
-function checkPinnedIdentity(hostname: string, peer: PeerCertificate, expectedKey: Uint8Array): Error | undefined {
-  const hostnameError = checkServerIdentity(hostname, peer);
-  if (hostnameError) return hostnameError;
+function checkPinnedIdentity(hostname: string, peer: PeerCertificate, expectedKey: Uint8Array, checkHostname = true): Error | undefined {
+  if (checkHostname) {
+    const hostnameError = checkServerIdentity(hostname, peer);
+    if (hostnameError) return hostnameError;
+  }
   if (!peer.raw) return new Error('relay did not provide a TLS certificate');
   try {
     const cert = new X509Certificate(peer.raw);

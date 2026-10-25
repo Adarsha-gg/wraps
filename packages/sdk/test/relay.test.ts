@@ -124,10 +124,10 @@ describe('pinned relay transport', () => {
     return { fetchImpl, requested };
   }
 
-  async function relayTransport(options: { cert?: string; attestationUrl?: string } = {}) {
+  async function relayTransport(options: { cert?: string; attestationUrl?: string; relayUrl?: string } = {}) {
     const fake = fetchAttestation(options.cert);
     const transport = await createPinnedRelayTransport({
-      relayUrl: proxyUrl,
+      relayUrl: options.relayUrl ?? proxyUrl,
       issuerUrl: 'https://issuer.example',
       verifier: verifier(),
       attestationUrl: options.attestationUrl,
@@ -183,6 +183,16 @@ describe('pinned relay transport', () => {
     expect(connectHeaders[0]).toContain(encodeAuthorization(batches[0]));
     expect(connectHeaders[1]).toContain(encodeAuthorization(batches[1]));
     expect(tokenId(batches[0][0])).not.toBe(tokenId(batches[1][0]));
+  });
+
+  it('connects to an IP-address relay without sending an invalid IP TLS server name', async () => {
+    connectHeaders.length = 0;
+    const { transport } = await relayTransport({ relayUrl: proxyUrl.replace('localhost', '127.0.0.1') });
+    await expect(transport.fetchWithTokens('https://merchant.example/data', {}, await issueTokens(1))).rejects.toThrow();
+    await transport.close();
+
+    expect(connectHeaders).toHaveLength(1);
+    expect(connectHeaders[0]).toContain('CONNECT merchant.example:443');
   });
 
   it('opens an unauthenticated CONNECT only to the configured issuer and pins its TLS peer', async () => {
