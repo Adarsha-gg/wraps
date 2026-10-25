@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer as createTlsServer, type Server as TlsServer } from 'node:tls';
+import { connect as tcpConnect } from 'node:net';
 import { once } from 'node:events';
 import { X509Certificate } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -42,7 +43,10 @@ describe('pinned relay transport', () => {
   let relayIdentity: TlsIdentity;
   let otherIdentity: TlsIdentity;
   let proxy: TlsServer;
+  let issuerServer: TlsServer;
   let proxyUrl: string;
+  let issuerServerPort: number;
+  let issuerRequests = 0;
   const connectHeaders: string[] = [];
   const verifier = () => new MockAttestationVerifier({ expectedPcrs: mockPcrs('relay') });
 
@@ -50,6 +54,23 @@ describe('pinned relay transport', () => {
     certDir = await mkdtemp(join(tmpdir(), 'wraps-sdk-relay-'));
     relayIdentity = await generateTlsIdentity(certDir, 'relay');
     otherIdentity = await generateTlsIdentity(certDir, 'other');
+    issuerServer = createTlsServer({ key: relayIdentity.key, cert: relayIdentity.cert }, (socket) => {
+      let buffered = Buffer.alloc(0);
+      const onData = (chunk: Buffer) => {
+        buffered = Buffer.concat([buffered, chunk]);
+        if (!buffered.includes('\r\n\r\n')) return;
+        socket.off('data', onData);
+        issuerRequests++;
+        socket.end('HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nissuer response');
+      };
+      socket.on('data', onData);
+    });
+    issuerServer.listen(0);
+    await once(issuerServer, 'listening');
+    const issuerAddress = issuerServer.address();
+    if (!issuerAddress || typeof issuerAddress === 'string') throw new Error('issuer test server did not bind');
+    issuerServerPort = issuerAddress.port;
+
     proxy = createTlsServer({ key: relayIdentity.key, cert: relayIdentity.cert }, (socket) => {
       let buffered = Buffer.alloc(0);
       const onData = (chunk: Buffer) => {
@@ -59,7 +80,16 @@ describe('pinned relay transport', () => {
         socket.off('data', onData);
         const headers = buffered.subarray(0, end).toString('latin1');
         connectHeaders.push(headers);
-        socket.end('HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+        if (headers.startsWith('CONNECT issuer.example:443 ')) {
+          socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          const upstream = tcpConnect(issuerServerPort, '127.0.0.1');
+          upstream.once('connect', () => {
+            socket.pipe(upstream);
+            upstream.pipe(socket);
+          });
+        } else {
+          socket.end('HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+        }
       };
       socket.on('data', onData);
     });
@@ -72,7 +102,9 @@ describe('pinned relay transport', () => {
 
   afterAll(async () => {
     proxy?.close();
+    issuerServer?.close();
     if (proxy?.listening) await once(proxy, 'close');
+    if (issuerServer?.listening) await once(issuerServer, 'close');
     if (certDir) await rm(certDir, { recursive: true, force: true });
   });
 
@@ -96,6 +128,7 @@ describe('pinned relay transport', () => {
     const fake = fetchAttestation(options.cert);
     const transport = await createPinnedRelayTransport({
       relayUrl: proxyUrl,
+      issuerUrl: 'https://issuer.example',
       verifier: verifier(),
       attestationUrl: options.attestationUrl,
       fetchImpl: fake.fetchImpl,
@@ -152,6 +185,44 @@ describe('pinned relay transport', () => {
     expect(tokenId(batches[0][0])).not.toBe(tokenId(batches[1][0]));
   });
 
+  it('opens an unauthenticated CONNECT only to the configured issuer and pins its TLS peer', async () => {
+    connectHeaders.length = 0;
+    const { transport } = await relayTransport();
+    const bootstrap = await transport.fetchIssuerWithPeer('https://issuer.example/attestation?nonce=test');
+    expect(Buffer.from(bootstrap.peerSpki)).toEqual(Buffer.from(relayIdentity.spki));
+    expect(await bootstrap.response.text()).toBe('issuer response');
+
+    const pinned = await transport.fetchIssuer('https://issuer.example/issue', {}, relayIdentity.spki);
+    expect(pinned.status).toBe(200);
+    expect(await pinned.text()).toBe('issuer response');
+
+    await expect(transport.fetchIssuerWithPeer('https://attacker.example/attestation')).rejects.toThrow(/restricted/);
+    const beforeWrongPin = issuerRequests;
+    await expect(transport.fetchIssuer('https://issuer.example/issue', {}, otherIdentity.spki)).rejects.toThrow();
+    expect(issuerRequests).toBe(beforeWrongPin);
+    await transport.close();
+
+    expect(connectHeaders).toHaveLength(3);
+    for (const headers of connectHeaders) expect(headers.toLowerCase()).not.toContain('proxy-authorization:');
+  });
+
+  it('restricts tokenless issuer CONNECT to credential-free port 443 origins', async () => {
+    connectHeaders.length = 0;
+    const fake = fetchAttestation();
+    await expect(createPinnedRelayTransport({
+      relayUrl: proxyUrl,
+      issuerUrl: 'https://issuer.example:8443',
+      verifier: verifier(),
+      fetchImpl: fake.fetchImpl,
+    })).rejects.toThrow(/port 443/);
+
+    const { transport } = await relayTransport();
+    await expect(transport.fetchIssuerWithPeer('https://user@issuer.example/attestation')).rejects.toThrow(/restricted/);
+    await expect(transport.fetchIssuerWithPeer('https://issuer.example/attestation#fragment')).rejects.toThrow(/restricted/);
+    await transport.close();
+    expect(connectHeaders).toHaveLength(0);
+  });
+
   it('pins the TLS public key and rejects a different proxy key', async () => {
     const { transport } = await relayTransport({ cert: otherIdentity.cert });
     const tokens = await issueTokens(1);
@@ -167,6 +238,7 @@ describe('pinned relay transport', () => {
     });
     await expect(createPinnedRelayTransport({
       relayUrl: proxyUrl,
+      issuerUrl: 'https://issuer.example',
       verifier: verifier(),
       fetchImpl: slowFetch,
       attestationTimeoutMs: 10,
@@ -174,6 +246,7 @@ describe('pinned relay transport', () => {
 
     await expect(createPinnedRelayTransport({
       relayUrl: proxyUrl,
+      issuerUrl: 'https://issuer.example',
       verifier: verifier(),
       fetchImpl: async () => new Response('x'.repeat(100)),
       maxAttestationResponseBytes: 32,
@@ -202,10 +275,20 @@ describe('PrivatePayClient with a pinned relay', () => {
     await issuer?.close();
   });
 
-  function fakeRelay(onFetch: (url: string, init: RequestInit | undefined, tokens: Token[]) => Promise<Response>) {
+  function fakeRelay(
+    issuerUrl: string,
+    onFetch: (url: string, init: RequestInit | undefined, tokens: Token[]) => Promise<Response>,
+    onIssuer: (url: string, init: RequestInit | undefined) => Promise<Response> = (url, init) => fetch(url, init),
+  ) {
     return {
       relay: {} as PinnedRelayTransport['relay'],
+      issuerOrigin: new URL(issuerUrl).origin,
       fetchWithTokens: onFetch,
+      fetchIssuer: (url: string, init: RequestInit | undefined) => {
+        if (new URL(url).origin !== new URL(issuerUrl).origin) throw new TypeError('issuer origin restricted');
+        return onIssuer(url, init);
+      },
+      fetchIssuerWithPeer: async () => { throw new Error('HTTP issuer should not need peer bootstrap'); },
       close: async () => {},
     } satisfies PinnedRelayTransport;
   }
@@ -222,15 +305,19 @@ describe('PrivatePayClient with a pinned relay', () => {
     });
   }
 
-  it('bootstraps and tops up directly, then reserves two relay batches for a paid fetch', async () => {
+  it('bootstraps and tops up through the restricted issuer route, then reserves two meter batches', async () => {
     const directUrls: string[] = [];
+    const issuerUrls: string[] = [];
     const direct: Transport = async (url, init) => {
       directUrls.push(url);
       return fetch(url, init);
     };
     const calls: Array<{ tokens: Token[]; originAuthorization: string | null }> = [];
-    const relay = fakeRelay(async (url, init, tokens) => {
+    const relay = fakeRelay(issuer.url, async (url, init, tokens) => {
       calls.push({ tokens, originAuthorization: new Headers(init?.headers).get('authorization') });
+      return fetch(url, init);
+    }, async (url, init) => {
+      issuerUrls.push(url);
       return fetch(url, init);
     });
     const sdk = client({ relayTransport: relay, transport: direct });
@@ -243,8 +330,9 @@ describe('PrivatePayClient with a pinned relay', () => {
     expect(calls).toHaveLength(0);
 
     await sdk.topUp(4);
-    expect(directUrls.some((url) => url.includes('/attestation'))).toBe(true);
-    expect(directUrls.some((url) => url.includes('/issue'))).toBe(true);
+    expect(directUrls).toHaveLength(0);
+    expect(issuerUrls.some((url) => url.includes('/attestation'))).toBe(true);
+    expect(issuerUrls.some((url) => url.includes('/issue'))).toBe(true);
     const response = await sdk.fetch(`${merchantUrl}/analytics`);
     expect(response.status).toBe(200);
     expect(calls).toHaveLength(2);
@@ -257,7 +345,7 @@ describe('PrivatePayClient with a pinned relay', () => {
 
   it('charges the whole configured meter batch and counts it against daily caps', async () => {
     const batches: Token[][] = [];
-    const relay = fakeRelay(async (url, _init, tokens) => {
+    const relay = fakeRelay(issuer.url, async (url, _init, tokens) => {
       batches.push(tokens);
       return new Response(JSON.stringify({
         scheme: 'blindtoken',
@@ -281,7 +369,7 @@ describe('PrivatePayClient with a pinned relay', () => {
 
   it('includes the retry meter batch in the daily cap before consuming merchant tokens', async () => {
     let requests = 0;
-    const relay = fakeRelay(async (url, init) => {
+    const relay = fakeRelay(issuer.url, async (url, init) => {
       requests++;
       return fetch(url, init);
     });
@@ -297,7 +385,7 @@ describe('PrivatePayClient with a pinned relay', () => {
   it('consumes a reserved batch and does not retry after an ambiguous transport failure', async () => {
     let captured: Token[] = [];
     let requests = 0;
-    const relay = fakeRelay(async (_url, _init, tokens) => {
+    const relay = fakeRelay(issuer.url, async (_url, _init, tokens) => {
       requests++;
       captured = tokens;
       throw new Error('ambiguous CONNECT timeout');

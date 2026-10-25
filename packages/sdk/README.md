@@ -20,15 +20,16 @@ The attestation's `user_data` must bind `hashPublicKeys({ tunnel })` and the req
 ```ts
 const relayTransport = await createPinnedRelayTransport({
   relayUrl: 'https://relay.example:8443',
+  issuerUrl,
   verifier,
 });
 
 const sdk = new PrivatePayClient({ issuerUrl, verifier, wallet, caps, relayTransport });
 try {
   await sdk.connect();
-  await sdk.topUp(10); // issuer attestation and top-ups use direct HTTPS
+  await sdk.topUp(10); // issuer calls also travel through the relay
   await sdk.fetch('https://merchant.example/data');
-  // sdk.quote() and merchant fetches use the relay; issuer calls do not.
+  // issuer calls, quote(), and merchant fetches use the relay.
 } finally {
   await relayTransport.close();
 }
@@ -36,4 +37,4 @@ try {
 
 Relay mode requires a pre-top-up before the first merchant request because the relay needs a blind-token batch in `Proxy-Authorization` before it opens CONNECT and the merchant can issue its 402 challenge. The default is one dedicated relay token per tunnel, covering up to 10 MB. A paid fetch uses one relay batch for the initial challenge request, one for the retry, and the merchant's quoted price in separate origin `Authorization` credentials. `quote()` uses one relay batch. All reserved relay batches count against the daily cap and are removed before dispatch, even if the relay later reports an ambiguous failure. Set `relayTokensPerTunnel` between 1 and 100 to reserve a larger batch; the full batch is conservatively charged even when fewer metering blocks are settled.
 
-`transport` remains the direct transport for issuer attestation and top-ups. Without `relayTransport`, merchant traffic continues to use the existing direct transport behavior. The relay service must expose the pinned TLS endpoint and attestation response described above. The CONNECT listener expects its meter tokens only in `Proxy-Authorization`; the merchant's `Authorization` header remains end-to-end inside TLS.
+The issuer bootstrap and top-up requests are tunneled through the relay without meter tokens. This exception is restricted to the exact HTTPS issuer origin configured in `createPinnedRelayTransport`; the issuer's first TLS peer key is checked against its attestation, then pinned for later calls. The relay server must permit unauthenticated CONNECT only to that issuer host and port. Merchant CONNECT requests still require meter tokens in `Proxy-Authorization`; the merchant's `Authorization` header remains end-to-end inside TLS. Without `relayTransport`, `transport` and all direct behavior stay unchanged.

@@ -1,11 +1,16 @@
 import { randomBytes, timingSafeEqual, X509Certificate } from 'node:crypto';
-import { checkServerIdentity, type PeerCertificate } from 'node:tls';
+import { request as httpRequest } from 'node:http';
+import { isIP } from 'node:net';
+import { checkServerIdentity, connect as tlsConnect, type ConnectionOptions, type PeerCertificate, type TLSSocket } from 'node:tls';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { AttestationError, hashPublicKeys, fromB64u, type AttestationVerifier, type VerifiedAttestation } from '@wraps/attestation';
+import type { PeerResponse } from '@wraps/issuer';
 import { encodeAuthorization, type Token } from '@wraps/tokens';
 
 const DEFAULT_ATTESTATION_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_ATTESTATION_BYTES = 64 * 1024;
+const ISSUER_RESPONSE_TIMEOUT_MS = 15_000;
+const MAX_ISSUER_RESPONSE_BYTES = 1024 * 1024;
 const pinnedFetch = undiciFetch as unknown as (input: URL, init: RequestInit) => Promise<Response>;
 
 export interface RelayAttestationResponse {
@@ -25,14 +30,21 @@ export interface AttestedRelay {
 
 export interface PinnedRelayTransport {
   readonly relay: AttestedRelay;
+  readonly issuerOrigin: string;
   /** Opens a fresh CONNECT tunnel and puts these tokens only in its proxy authorization header. */
   fetchWithTokens(input: string, init: RequestInit | undefined, proxyTokens: Token[]): Promise<Response>;
+  /** First issuer request: no proxy meter auth, but records the target TLS peer SPKI. */
+  fetchIssuerWithPeer(input: string, init?: RequestInit): Promise<PeerResponse>;
+  /** Later issuer requests: no proxy meter auth and target TLS pinned to the attested SPKI. */
+  fetchIssuer(input: string, init: RequestInit | undefined, expectedSpki?: Uint8Array): Promise<Response>;
   close(): Promise<void>;
 }
 
 export interface RelayTransportOptions {
   /** HTTPS URL of the relay's CONNECT proxy. */
   relayUrl: string;
+  /** Exact HTTPS origin permitted for tokenless issuer CONNECTs. */
+  issuerUrl: string;
   verifier: AttestationVerifier;
   /** Optional untrusted URL used only to fetch a fresh, nonce-bound receipt. */
   attestationUrl?: string;
@@ -51,6 +63,11 @@ export async function createPinnedRelayTransport(opts: RelayTransportOptions): P
   }
   relayUrl.pathname = '/';
   relayUrl.search = '';
+  const issuerUrl = new URL(opts.issuerUrl);
+  if (issuerUrl.protocol !== 'https:' || issuerUrl.username || issuerUrl.password || issuerUrl.hash || issuerUrl.port) {
+    throw new TypeError('issuerUrl must be an HTTPS URL on port 443 without credentials or a fragment');
+  }
+  const issuerOrigin = issuerUrl.origin;
 
   const attestationUrl = opts.attestationUrl ? new URL(opts.attestationUrl) : new URL(relayUrl);
   if (!opts.attestationUrl) {
@@ -80,11 +97,16 @@ export async function createPinnedRelayTransport(opts: RelayTransportOptions): P
   const agents = new Set<ProxyAgent>();
   let closed = false;
 
-  const request = async (input: string, init: RequestInit | undefined, proxyTokens: Token[]): Promise<Response> => {
+  const request = async (
+    input: string,
+    init: RequestInit | undefined,
+    proxyTokens: Token[] | undefined,
+    requestTls?: ProxyAgent.Options['requestTls'],
+  ): Promise<Response> => {
     if (closed) throw new TypeError('pinned relay transport is closed');
     const target = new URL(input);
     if (target.protocol !== 'https:') throw new TypeError('relay transport only allows HTTPS destinations');
-    if (proxyTokens.length === 0) throw new TypeError('a blind-token batch is required for every relay tunnel');
+    if (proxyTokens && proxyTokens.length === 0) throw new TypeError('a blind-token batch is required for every metered relay tunnel');
 
     const headers = new Headers(init?.headers);
     // Proxy credentials belong to CONNECT only; callers cannot inject them into
@@ -92,11 +114,12 @@ export async function createPinnedRelayTransport(opts: RelayTransportOptions): P
     headers.delete('proxy-authorization');
     const agent = new ProxyAgent({
       uri: relayUrl.origin,
-      token: encodeAuthorization(proxyTokens),
+      ...(proxyTokens ? { token: encodeAuthorization(proxyTokens) } : {}),
       proxyTls: {
         ca: attested.tlsCertificate,
         checkServerIdentity: (hostname, peer) => checkPinnedIdentity(hostname, peer, attested.tunnelKey),
       },
+      ...(requestTls ? { requestTls } : {}),
     });
     agents.add(agent);
     const cleanup = async () => {
@@ -116,9 +139,31 @@ export async function createPinnedRelayTransport(opts: RelayTransportOptions): P
     return responseWithCleanup(response, cleanup);
   };
 
+  const checkIssuerOrigin = (input: string): URL => {
+    const target = new URL(input);
+    if (target.protocol !== 'https:' || target.origin !== issuerOrigin || target.username || target.password || target.hash) {
+      throw new TypeError(`issuer requests are restricted to ${issuerOrigin}`);
+    }
+    return target;
+  };
+
+  const fetchIssuerWithPeer = async (input: string, init?: RequestInit): Promise<PeerResponse> => {
+    const target = checkIssuerOrigin(input);
+    return requestIssuerThroughRelay(relayUrl, attested.tlsCertificate, attested.tunnelKey, target, init);
+  };
+
+  const fetchIssuer = (input: string, init: RequestInit | undefined, expectedSpki?: Uint8Array): Promise<Response> => {
+    const target = checkIssuerOrigin(input);
+    if (!expectedSpki) throw new TypeError('issuer requests require the attested TLS SPKI');
+    return requestIssuerThroughRelay(relayUrl, attested.tlsCertificate, attested.tunnelKey, target, init, expectedSpki).then(({ response }) => response);
+  };
+
   const transport: PinnedRelayTransport = {
     relay: attested,
-    fetchWithTokens: request,
+    issuerOrigin,
+    fetchWithTokens: (input, init, tokens) => request(input, init, tokens),
+    fetchIssuerWithPeer,
+    fetchIssuer,
     close: async () => {
       closed = true;
       await Promise.all([...agents].map(async (agent) => {
@@ -128,6 +173,199 @@ export async function createPinnedRelayTransport(opts: RelayTransportOptions): P
     },
   };
   return transport;
+}
+
+async function requestIssuerThroughRelay(
+  relayUrl: URL,
+  relayCertificate: string,
+  relaySpki: Uint8Array,
+  target: URL,
+  init?: RequestInit,
+  expectedIssuerSpki?: Uint8Array,
+): Promise<PeerResponse> {
+  let tunnel: TLSSocket | undefined;
+  try {
+    const relaySocket = await tlsHandshake({
+      host: relayUrl.hostname,
+      port: Number(relayUrl.port || 443),
+      servername: isIP(relayUrl.hostname.replace(/^\[|\]$/g, '')) ? undefined : relayUrl.hostname,
+      ca: relayCertificate,
+      ALPNProtocols: ['http/1.1'],
+      checkServerIdentity: (hostname, peer) => checkPinnedIdentity(hostname, peer, relaySpki),
+    });
+    await openIssuerConnect(relaySocket, target);
+
+    const targetHost = target.hostname.replace(/^\[|\]$/g, '');
+    tunnel = await tlsHandshake({
+      socket: relaySocket,
+      servername: isIP(targetHost) ? undefined : targetHost,
+      rejectUnauthorized: false,
+      ALPNProtocols: ['http/1.1'],
+    });
+    const peer = tunnel.getPeerX509Certificate();
+    if (!peer) throw new AttestationError('KEY_MISMATCH', 'issuer did not present a TLS certificate');
+    const peerSpki = new Uint8Array(peer.publicKey.export({ type: 'spki', format: 'der' }));
+    if (expectedIssuerSpki && !sameBytes(peerSpki, expectedIssuerSpki)) {
+      throw new AttestationError('KEY_MISMATCH', 'issuer TLS key does not match the attested key');
+    }
+    const response = await sendIssuerRequest(tunnel, target, init);
+    return { response, peerSpki };
+  } catch (error) {
+    tunnel?.destroy();
+    throw error;
+  }
+}
+
+function tlsHandshake(options: ConnectionOptions): Promise<TLSSocket> {
+  return new Promise((resolve, reject) => {
+    const socket = tlsConnect(options);
+    const timer = setTimeout(() => fail(new Error('issuer TLS handshake timed out')), ISSUER_RESPONSE_TIMEOUT_MS);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off('secureConnect', onSecure);
+      socket.off('error', onError);
+    };
+    const fail = (error: Error) => {
+      cleanup();
+      socket.destroy();
+      reject(error);
+    };
+    const onSecure = () => {
+      cleanup();
+      resolve(socket);
+    };
+    const onError = (error: Error) => fail(error);
+    socket.once('secureConnect', onSecure);
+    socket.once('error', onError);
+  });
+}
+
+async function openIssuerConnect(proxySocket: TLSSocket, target: URL): Promise<void> {
+  const authority = target.port ? target.host : `${target.host}:443`;
+  const request = `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nConnection: keep-alive\r\n\r\n`;
+  await new Promise<void>((resolve, reject) => {
+    let buffer = Buffer.alloc(0);
+    const timer = setTimeout(() => fail(new Error('issuer CONNECT timed out')), ISSUER_RESPONSE_TIMEOUT_MS);
+    const cleanup = () => {
+      clearTimeout(timer);
+      proxySocket.off('data', onData);
+      proxySocket.off('error', onError);
+    };
+    const fail = (error: Error) => {
+      cleanup();
+      proxySocket.destroy();
+      reject(error);
+    };
+    const onData = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length > 16 * 1024) {
+        fail(new Error('issuer CONNECT response headers are too large'));
+        return;
+      }
+      const end = buffer.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      const header = buffer.subarray(0, end).toString('latin1');
+      const status = /^HTTP\/1\.[01] (\d{3})\b/.exec(header)?.[1];
+      if (status !== '200') {
+        fail(new Error(`relay refused issuer CONNECT with HTTP ${status ?? 'invalid'}`));
+        return;
+      }
+      cleanup();
+      const extra = buffer.subarray(end + 4);
+      proxySocket.pause();
+      if (extra.length > 0) proxySocket.unshift(extra);
+      proxySocket.resume();
+      resolve();
+    };
+    const onError = (error: Error) => fail(error);
+    proxySocket.on('data', onData);
+    proxySocket.once('error', onError);
+    proxySocket.write(request);
+  });
+}
+
+async function sendIssuerRequest(socket: TLSSocket, target: URL, init?: RequestInit): Promise<Response> {
+  const method = init?.method ?? 'GET';
+  const headers: Record<string, string> = {};
+  new Headers(init?.headers).forEach((value, name) => {
+    if (name.toLowerCase() !== 'proxy-authorization') headers[name] = value;
+  });
+  headers.connection = 'close';
+  const body = toRequestBuffer(init?.body);
+  if (body) headers['content-length'] = String(body.byteLength);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let responseSize = 0;
+    const chunks: Buffer[] = [];
+    const timer = setTimeout(() => fail(new Error('issuer HTTP response timed out')), ISSUER_RESPONSE_TIMEOUT_MS);
+    const signal = init?.signal;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      socket.destroy(error);
+      reject(error);
+    };
+    const onAbort = () => fail(signal?.reason instanceof Error ? signal.reason : new Error('issuer request aborted'));
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    const request = httpRequest({
+      host: target.hostname.replace(/^\[|\]$/g, ''),
+      port: Number(target.port || 443),
+      path: `${target.pathname}${target.search}`,
+      method,
+      headers,
+      createConnection: () => socket,
+    }, (res) => {
+      res.on('data', (chunk: Buffer) => {
+        responseSize += chunk.length;
+        if (responseSize > MAX_ISSUER_RESPONSE_BYTES) {
+          fail(new Error(`issuer response exceeds ${MAX_ISSUER_RESPONSE_BYTES} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        const responseHeaders = new Headers();
+        for (const [name, value] of Object.entries(res.headers)) {
+          if (value !== undefined) responseHeaders.set(name, Array.isArray(value) ? value.join(', ') : value);
+        }
+        const status = res.statusCode ?? 0;
+        const noBody = status === 204 || status === 304;
+        const response = new Response(noBody ? null : Buffer.concat(chunks), {
+          status,
+          statusText: res.statusMessage,
+          headers: responseHeaders,
+        });
+        socket.destroy();
+        resolve(response);
+      });
+      res.on('aborted', () => fail(new Error('issuer response was aborted')));
+      res.on('error', fail);
+    });
+    request.on('error', fail);
+    request.end(body);
+  });
+}
+
+function toRequestBuffer(body: BodyInit | null | undefined): Buffer | undefined {
+  if (body == null) return undefined;
+  if (typeof body === 'string') return Buffer.from(body);
+  if (body instanceof ArrayBuffer) return Buffer.from(body);
+  if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  throw new TypeError('issuer relay requests support string or byte bodies only');
 }
 
 async function fetchAttestedRelay(

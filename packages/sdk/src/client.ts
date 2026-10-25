@@ -59,9 +59,9 @@ export interface PrivatePayOptions {
   verifier: AttestationVerifier;
   wallet: TopUpWallet;
   caps: Caps;
-  /** Direct transport for issuer attestation and top-ups. Defaults to fetch. */
+  /** Direct transport when no relay is configured. Defaults to fetch. */
   transport?: Transport;
-  /** Pinned relay used for merchant traffic; issuer attestation/top-ups stay direct. */
+  /** Pinned relay for all network traffic, with a restricted tokenless issuer route. */
   relayTransport?: PinnedRelayTransport;
   /** Blind tokens reserved for each new relay CONNECT. Defaults to 1 (10 MB of metering). */
   relayTokensPerTunnel?: number;
@@ -113,8 +113,11 @@ export class PrivatePayClient {
   async connect(): Promise<AttestedIssuer> {
     this.issuer = undefined;
     this.issuerCall = undefined;
-    const issuer = await fetchAttestedIssuer(this.opts.issuerUrl, this.opts.verifier, this.transport);
-    this.issuerCall = issuerTransport(issuer, this.transport);
+    const issuerRoute = this.opts.relayTransport
+      ? issuerRouteThroughRelay(this.opts.relayTransport)
+      : this.transport;
+    const issuer = await fetchAttestedIssuer(this.opts.issuerUrl, this.opts.verifier, issuerRoute);
+    this.issuerCall = issuerTransport(issuer, issuerRoute);
     this.issuer = issuer;
     this.tokenVerifier = new TokenVerifier(issuer.tokenKey, issuer.issuerName);
     const m = issuer.attestation.measurement;
@@ -280,4 +283,11 @@ export class PrivatePayClient {
     });
     return { status: res.status, body: (await res.json()) as any };
   }
+}
+
+function issuerRouteThroughRelay(relay: PinnedRelayTransport): Transport {
+  const route = ((url: string, init?: RequestInit) => relay.fetchIssuer(url, init)) as Transport;
+  route.fetchWithPeer = (url, init) => relay.fetchIssuerWithPeer(url, init);
+  route.fetchPinned = (url, expectedSpki, init) => relay.fetchIssuer(url, init, expectedSpki);
+  return route;
 }
