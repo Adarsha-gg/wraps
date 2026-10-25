@@ -23,6 +23,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
         .manage(bridge::Pending::default())
+        .manage(vpn::PendingJoin::default())
         .invoke_handler(tauri::generate_handler![
             quit,
             bridge::browser_wallet,
@@ -30,7 +31,12 @@ pub fn run() {
             merchant_auth::merchant_auth_public_key,
             vpn::vpn_attest,
             vpn::vpn_connect,
-            vpn::vpn_disconnect
+            vpn::vpn_disconnect,
+            vpn::topup_mock,
+            vpn::topup_quote,
+            vpn::topup_paid,
+            vpn::topup_cancel,
+            vpn::open_tx
         ])
         .manage(LastHide(Mutex::new(Instant::now() - Duration::from_secs(1))))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())

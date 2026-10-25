@@ -1,8 +1,11 @@
 // Seam between the UI and the VPN network (nodes, attestation, tunnel). TauriBackend is the
 // real one-click VPN (attested relay + WireGuard, see src-tauri/src/vpn.rs); MockBackend is
 // for the browser dev preview. Wallet top-ups live in tokens.ts.
+import type { Quote } from './tokens.ts';
 
-export type Flag = { bg?: string; h?: string[]; nordic?: [string, string?]; cross?: string; dot?: string };
+
+// canton: top-left block (US). fullCross: [border, cross] across the whole flag (UK, simplified).
+export type Flag = { bg?: string; h?: string[]; nordic?: [string, string?]; cross?: string; dot?: string; canton?: string; fullCross?: [string, string] };
 
 export type VpnNode = {
   id: string;
@@ -18,12 +21,14 @@ export type Attestation =
   | { ok: true; tee: 'tdx' | 'sev' | 'sev-snp'; build: string; checkedAt: number }
   | { ok: false; reason: string; checkedAt: number };
 
-export type Activity = { title: string; detail: string; usd: number; at: number };
+/** Where the issuer pays merchants (VPN relays and the demo API). Must match MERCHANT_PAYOUT_ADDRESSES in infra/gcp/issuer.Dockerfile. */
+export const MERCHANT_PAYOUT = '0x34A7142038CDd6946ecc8a231e49c45E62A7F562';
+
+export type Activity = { title: string; detail: string; usd: number; at: number; tx?: string };
 
 export interface Backend {
   listNodes(): Promise<VpnNode[]>;
   attest(nodeId: string): Promise<Attestation>;
-  connect(nodeId: string): Promise<void>;
   disconnect(): Promise<void>;
 }
 
@@ -53,12 +58,15 @@ export class MockBackend implements Backend {
   async disconnect() {}
 }
 
-// The live wraps relay: Google Confidential Space (AMD SEV), reserved IP.
-const LIVE_RELAY: VpnNode = {
-  id: 'usc1', city: 'Iowa', country: 'United States',
-  flag: { h: ['#B22234', '#FFFFFF', '#3C3B6E'] },
-  ip: '136.80.57.82', pricePerMB: 0.01, latencyMs: 30, // 1 token = 10 MB = $0.10
-};
+// The live wraps relays: the same attested image in Google Confidential Space (AMD SEV), each on a
+// reserved IP. Tokens from the one issuer work at any of them. 1 token = 10 MB = $0.10.
+// latencyMs: TCP connect time measured from the dev laptop (US West), 2026-10-25.
+const LIVE_RELAYS: VpnNode[] = [
+  { id: 'usc1', city: 'Iowa', country: 'United States', flag: { canton: '#3C3B6E', h: ['#B22234', '#FFFFFF', '#B22234', '#FFFFFF', '#B22234', '#FFFFFF', '#B22234'] }, ip: '136.80.57.82', pricePerMB: 0.01, latencyMs: 38 },
+  { id: 'ams', city: 'Eemshaven', country: 'Netherlands', flag: { h: ['#AE1C28', '#FFFFFF', '#21468B'] }, ip: '34.141.178.44', pricePerMB: 0.01, latencyMs: 84 },
+  { id: 'lon', city: 'London', country: 'United Kingdom', flag: { bg: '#012169', fullCross: ['#FFFFFF', '#C8102E'] }, ip: '35.234.141.198', pricePerMB: 0.01, latencyMs: 77 },
+];
+const relayIp = (nodeId: string) => (LIVE_RELAYS.find(n => n.id === nodeId) ?? LIVE_RELAYS[0]).ip;
 
 /** Real backend: verify the attested relay, pay it, bring WireGuard up. No other app needed. */
 export class TauriBackend implements Backend {
@@ -66,16 +74,24 @@ export class TauriBackend implements Backend {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke<T>(cmd, args);
   }
-  async listNodes() { return [LIVE_RELAY]; }
-  async attest(_nodeId: string): Promise<Attestation> {
+  async listNodes() { return LIVE_RELAYS; }
+  async attest(nodeId: string): Promise<Attestation> {
     try {
-      const r = await this.call<{ ok: boolean; imageDigest: string }>('vpn_attest');
+      const r = await this.call<{ ok: boolean; imageDigest: string }>('vpn_attest', { relay: relayIp(nodeId) });
       return { ok: true, tee: 'sev', build: `${r.imageDigest.slice(7, 11)}…${r.imageDigest.slice(-2)}`, checkedAt: Date.now() };
     } catch (e) {
       return { ok: false, reason: String(e).slice(0, 120), checkedAt: Date.now() };
     }
   }
-  /** Buys and pays 10 tokens (100 MB), registers a fresh key, turns the tunnel on. */
-  async connect(_nodeId: string) { await this.call('vpn_connect', { tokens: 10 }); }
+  /** Pays the relay with these kept tokens (10 MB each), registers a fresh key, turns the tunnel on. */
+  async connectWith(tokens: string[], nodeId: string) { return this.call<{ tokens: number; megabytes: number }>('vpn_connect', { tokens, relay: relayIp(nodeId) }); }
+  /** Mock rail top-up from the live issuer. Returns the tokens for the wallet to keep. */
+  async topUpMock(n: number) { return (await this.call<{ tokens: string[] }>('topup_mock', { tokens: n })).tokens; }
+  /** RLUSD top-up, step 1: the attested issuer's quote for `n` tokens. */
+  async topUpQuote(n: number) { return this.call<Quote>('topup_quote', { tokens: n }); }
+  /** RLUSD top-up, step 2: the quote is paid in `txHash`. Returns the tokens for the wallet to keep. */
+  async topUpPaid(txHash: string) { return (await this.call<{ tokens: string[] }>('topup_paid', { txHash })).tokens; }
+  async topUpCancel() { await this.call('topup_cancel'); }
+  async openTx(txHash: string) { await this.call('open_tx', { txHash }); }
   async disconnect() { await this.call('vpn_disconnect'); }
 }

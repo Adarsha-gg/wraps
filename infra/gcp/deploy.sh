@@ -6,6 +6,8 @@
 #   Add --canary to add a role-specific firewall tag for source-restricted ingress rules.
 #   Add --dry-run to print the create command without changing GCP.
 # Existing VMs are preserved unless --replace is explicitly supplied.
+# Another relay region: INSTANCE_NAME=wraps-relay-nl GCP_REGION=europe-west4 GCP_ZONE=europe-west4-a RELAY_ADDRESS=... ...
+#   Add --dry-run after the role options to print the create command without changing GCP.
 source "$(dirname "$0")/lib.sh"
 ROLE="${1:-}"; check_role "${ROLE}"
 MODE=prod; DRY_RUN=0; REPLACE=0; CANARY=0; INSTANCE_NAME=''

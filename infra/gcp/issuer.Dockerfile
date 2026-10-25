@@ -33,8 +33,9 @@ COPY --from=build /out/issuer.mjs /app/issuer.mjs
 COPY --from=build /out/issuer-merchant-auth.json /app/issuer-merchant-auth.json
 COPY infra/gcp/issuer-start.sh /app/issuer-start.sh
 
-# Allow only Secret Manager references as deployment metadata. Merchant public keys are
-# baked into the image and therefore covered by its attested digest.
+# The canary uses mock top-ups and payouts. Merchant public keys and encrypted state resources are
+# baked into the image and covered by its attested digest; deployment metadata may set only the
+# pinned Secret Manager version reference.
 ENV NODE_ENV=production \
     TZ=UTC \
     ATTESTATION=confidential-space \
@@ -44,7 +45,9 @@ ENV NODE_ENV=production \
     GCP_WIF_PROVIDER=${GCP_WIF_PROVIDER} \
     ISSUER_STATE_GCS_BUCKET=${ISSUER_STATE_GCS_BUCKET} \
     ISSUER_STATE_GCS_PREFIX=${ISSUER_STATE_GCS_PREFIX} \
-    ISSUER_STATE_KMS_KEY=${ISSUER_STATE_KMS_KEY}
+    ISSUER_STATE_KMS_KEY=${ISSUER_STATE_KMS_KEY} \
+    ISSUER_RAIL=mock \
+    PAYOUT_RAIL=mock
 
 # Confidential Space blocks inbound ports unless the image exposes them.
 EXPOSE 443/tcp
