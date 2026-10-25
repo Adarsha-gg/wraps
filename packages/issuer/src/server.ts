@@ -5,6 +5,7 @@
 //   POST /settle   {merchantId, tokens}  mark spent, add to tab, signed running-total claim
 //   GET  /reserves                  signed "outstanding ≤ funds held"
 import { createServer, Server } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
 import { IssuerCore, IssuerError } from './core';
 import { HttpError, RateLimiter, readJson, sendJson } from './http';
 import { PAYMENT_HEADER, PaymentRequiredBody } from './protocol';
@@ -12,12 +13,14 @@ import { PAYMENT_HEADER, PaymentRequiredBody } from './protocol';
 export interface IssuerServerOptions {
   /** Attestation requests per IP per minute. */
   attestationRateLimit?: number;
+  /** Serve https with this key and self-signed certificate (PEM). */
+  tls?: { keyPem: string; certPem: string };
 }
 
 export function createIssuerServer(core: IssuerCore, opts: IssuerServerOptions = {}): Server {
   const limiter = new RateLimiter(opts.attestationRateLimit ?? 60, 60_000);
 
-  return createServer(async (req, res) => {
+  const handler: Parameters<typeof createServer>[1] = async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', 'http://issuer');
       const route = `${req.method} ${url.pathname}`;
@@ -66,5 +69,6 @@ export function createIssuerServer(core: IssuerCore, opts: IssuerServerOptions =
       if (status === 500) console.error('[issuer] internal error', e);
       sendJson(res, status, { error: status === 500 ? 'internal error' : (e as Error).message });
     }
-  });
+  };
+  return opts.tls ? createHttpsServer({ key: opts.tls.keyPem, cert: opts.tls.certPem }, handler) : createServer(handler);
 }
