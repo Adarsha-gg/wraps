@@ -1,0 +1,21 @@
+{
+  "audience": "https://wraps.invalid/issuer",
+  "hwModels": [
+    "GCP_AMD_SEV"
+  ],
+  "requiredSupportAttribute": "STABLE",
+  "roles": {
+    "issuer": {
+      "imageDigest": "sha256:892a2b1a22c5a911c221ce7f31aee477f33bf986083111c843935213dbc6fbea",
+      "imageReference": "us-central1-docker.pkg.dev/wraps-hack/wraps/issuer@sha256:892a2b1a22c5a911c221ce7f31aee477f33bf986083111c843935213dbc6fbea",
+      "tag": "1df3bee",
+      "builtAt": "2026-10-25T01:33:08.569Z"
+    },
+    "relay": {
+      "imageDigest": "sha256:9d51a71a24d5a1b14be64980a62d557bb0d1d55d7bb6621201edbe7bf1ba48f2",
+      "imageReference": "us-central1-docker.pkg.dev/wraps-hack/wraps/relay@sha256:9d51a71a24d5a1b14be64980a62d557bb0d1d55d7bb6621201edbe7bf1ba48f2",
+      "tag": "18e872e-dirty",
+      "builtAt": "2026-10-25T02:07:34.658Z"
+    }
+  }
+}
