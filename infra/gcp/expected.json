@@ -12,10 +12,13 @@
       "builtAt": "2026-10-25T01:33:08.569Z"
     },
     "relay": {
-      "imageDigest": "sha256:c1ffed0e504db15584d25dcdd0c742f1781e31ae7d64525c5750962d62b9d55e",
-      "imageReference": "us-central1-docker.pkg.dev/wraps-hack/wraps/relay@sha256:c1ffed0e504db15584d25dcdd0c742f1781e31ae7d64525c5750962d62b9d55e",
-      "tag": "59c9abb",
-      "builtAt": "2026-10-25T06:41:40.790Z"
+      "imageDigest": "sha256:1d035f584ccc0368b88b4fe4230e0bd4f97abc0da70f604eee61ff55a60cca1e",
+      "imageReference": "us-central1-docker.pkg.dev/wraps-hack/wraps/relay@sha256:1d035f584ccc0368b88b4fe4230e0bd4f97abc0da70f604eee61ff55a60cca1e",
+      "tag": "43b6311-wifbd0ad44814c7",
+      "builtAt": "2026-10-25T09:52:35.676Z",
+      "config": {
+        "gcpWifProvider": "projects/988228136185/locations/global/workloadIdentityPools/wraps-attested/providers/wraps-cs"
+      }
     }
   }
 }
