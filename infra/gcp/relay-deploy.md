@@ -29,7 +29,7 @@ tcp:443 and tcp:8080 for tag `wraps`.
 Set `WG_ENABLED=true` to start the WireGuard gateway alongside HTTPS CONNECT. The
 workload then requires `WG_ENDPOINT`, `WG_INTERFACE_ADDRESS`, and
 `WG_PEERS_JSON` (a JSON array of `{ "publicKey", "allowedAddress" }` objects).
-The gateway uses UDP 51820 and `WG_EGRESS_INTERFACE` defaults to `ens4`. Peer
+The gateway uses UDP 51820 and `WG_EGRESS_INTERFACE` defaults to `eth0`. Peer
 private keys must remain on clients; the deployment receives public
 keys only. Do not put client private keys or server private keys in metadata.
 
